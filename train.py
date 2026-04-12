@@ -2,66 +2,91 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import time
-import re
+import gzip
+import json
+import os
 
-block_size = 128
-batch_size = 32  # Меньше батч = лучше качество
-n_embed = 384  # Больше нейронов
-n_head = 6
-n_layer = 6
-lr = 3e-4
-steps = 20000  # Больше шагов
-warmup_steps = 2000
+config = {
+    "block_size": 128,
+    "batch_size": 64,
+    "n_embed": 384,
+    "n_head": 6,
+    "n_layer": 6,
+    "lr": 3e-4,
+    "steps": 20000,
+    "warmup_steps": 2000,
+    "eval_interval": 500,
+    "eval_iters": 100,
+    "temperature": 0.7,
+    "top_k": 50
+}
 
-print("🧠 УМНОЕ ОБУЧЕНИЕ (4-6 часов)")
-print("=" * 50)
+print("=" * 60)
+print("КОМФОРТНАЯ НЕЙРОСЕТЬ ДЛЯ ОБЩЕНИЯ")
+print("=" * 60)
 
-# ============ ЗАГРУЗКА БОЛЬШЕ ДАННЫХ ============
-print("📖 Загрузка данных...")
-with open("dialogs.txt", "r", encoding="utf-8") as f:
-    # Берем первые 50 млн символов (10x больше!)
-    text = f.read()[:50000000]
+print("\nЗагрузка диалогов...")
+dialogues = []
+with gzip.open("conversations.jsonl.gz", "rt", encoding="utf-8") as f:
+    for i, line in enumerate(f):
+        if i >= 100000:
+            break
+        data = json.loads(line)
+        conversation = data['conversation']
+        lines = conversation.strip().split('\n')
+        cleaned = []
+        for l in lines:
+            l = l.strip()
+            if l.startswith('—') or l.startswith('-') or l.startswith('•'):
+                l = l[1:].strip()
+            if l and len(l) > 2:
+                cleaned.append(l)
+        for j in range(0, len(cleaned) - 1, 2):
+            if j + 1 < len(cleaned):
+                dialogues.append(f"Вопрос: {cleaned[j]}\nОтвет: {cleaned[j+1]}\n\n")
+        if (i + 1) % 20000 == 0:
+            print(f"   Загружено {i + 1} диалогов...")
 
-print(f"   Символов: {len(text):,}")
-print(f"   Диалогов: {text.count('Вопрос:'):,}")
+text = "".join(dialogues)
+print(f"\nЗагружено {len(dialogues)} диалогов")
+print(f"Всего символов: {len(text):,}")
 
-# ============ УЛУЧШЕННЫЙ СЛОВАРЬ ============
-# Добавляем все возможные символы русского языка
-extra_chars = "абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ .,!?;:()\"'-"
-chars = sorted(list(set(text + extra_chars)))
-vocab_size = len(chars)
-print(f"   Словарь: {vocab_size} символов")
+print("\nСоздание словаря...")
+russian_chars = "абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+punctuation = " .,!?;:()\"'-—\n"
+all_chars = sorted(list(set(text + russian_chars + punctuation)))
+vocab_size = len(all_chars)
 
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
+stoi = {ch: i for i, ch in enumerate(all_chars)}
+itos = {i: ch for i, ch in enumerate(all_chars)}
 
 data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
 n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
 
-print(f"   Train: {len(train_data):,} символов")
-print(f"   Val: {len(val_data):,} символов")
-print()
+print(f"Словарь: {vocab_size} символов")
+print(f"Train: {len(train_data):,} символов")
+print(f"Val: {len(val_data):,} символов")
 
+del dialogues
+del text
 
 def get_batch(split):
     data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size - 1, (batch_size,))
-    x = torch.stack([data[i:i + block_size] for i in ix])
-    y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
+    ix = torch.randint(len(data) - config["block_size"] - 1, (config["batch_size"],))
+    x = torch.stack([data[i:i+config["block_size"]] for i in ix])
+    y = torch.stack([data[i+1:i+config["block_size"]+1] for i in ix])
     return x, y
 
-
-# ============ МОДЕЛЬ ============
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.key = nn.Linear(config["n_embed"], head_size, bias=False)
+        self.query = nn.Linear(config["n_embed"], head_size, bias=False)
+        self.value = nn.Linear(config["n_embed"], head_size, bias=False)
         self.dropout = nn.Dropout(0.1)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.register_buffer("tril", torch.tril(torch.ones(config["block_size"], config["block_size"])))
 
     def forward(self, x):
         B, T, C = x.shape
@@ -74,13 +99,12 @@ class Head(nn.Module):
         v = self.value(x)
         return wei @ v
 
-
 class MultiHead(nn.Module):
     def __init__(self):
         super().__init__()
-        head_size = n_embed // n_head
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(n_head)])
-        self.proj = nn.Linear(n_embed, n_embed)
+        head_size = config["n_embed"] // config["n_head"]
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(config["n_head"])])
+        self.proj = nn.Linear(config["n_embed"], config["n_embed"])
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
@@ -89,43 +113,40 @@ class MultiHead(nn.Module):
         out = self.dropout(out)
         return out
 
-
 class FeedForward(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
+            nn.Linear(config["n_embed"], 4 * config["n_embed"]),
             nn.GELU(),
-            nn.Linear(4 * n_embed, n_embed),
+            nn.Linear(4 * config["n_embed"], config["n_embed"]),
             nn.Dropout(0.1)
         )
 
     def forward(self, x):
         return self.net(x)
 
-
 class Block(nn.Module):
     def __init__(self):
         super().__init__()
         self.sa = MultiHead()
         self.ff = FeedForward()
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.ln2 = nn.LayerNorm(n_embed)
+        self.ln1 = nn.LayerNorm(config["n_embed"])
+        self.ln2 = nn.LayerNorm(config["n_embed"])
 
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.ff(self.ln2(x))
         return x
 
-
-class GPT(nn.Module):
+class ComfortableGPT(nn.Module):
     def __init__(self):
         super().__init__()
-        self.token_embed = nn.Embedding(vocab_size, n_embed)
-        self.pos_embed = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential(*[Block() for _ in range(n_layer)])
-        self.ln = nn.LayerNorm(n_embed)
-        self.head = nn.Linear(n_embed, vocab_size)
+        self.token_embed = nn.Embedding(vocab_size, config["n_embed"])
+        self.pos_embed = nn.Embedding(config["block_size"], config["n_embed"])
+        self.blocks = nn.Sequential(*[Block() for _ in range(config["n_layer"])])
+        self.ln = nn.LayerNorm(config["n_embed"])
+        self.head = nn.Linear(config["n_embed"], vocab_size)
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -145,122 +166,151 @@ class GPT(nn.Module):
         x = self.ln(x)
         return self.head(x)
 
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-model = GPT().to(device)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = ComfortableGPT().to(device)
 
 total_params = sum(p.numel() for p in model.parameters())
-print(f"🧠 Параметров: {total_params:,}")
-print(f"🎮 Устройство: {device}")
+print(f"\nПараметров: {total_params:,}")
+print(f"Устройство: {device}")
 print()
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-
+optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=0.01)
 
 def get_lr(step):
-    if step < warmup_steps:
-        return lr * (step + 1) / warmup_steps
-    progress = (step - warmup_steps) / (steps - warmup_steps)
-    return lr * 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
-
+    if step < config["warmup_steps"]:
+        return config["lr"] * (step + 1) / config["warmup_steps"]
+    progress = (step - config["warmup_steps"]) / (config["steps"] - config["warmup_steps"])
+    return config["lr"] * 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=get_lr)
 
-print("🚀 Старт обучения!")
-print("⏱️  Будет готово через 4-6 часов")
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(config["eval_iters"])
+        for k in range(config["eval_iters"]):
+            x, y = get_batch(split)
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            losses[k] = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+@torch.no_grad()
+def generate_response(question, max_new_tokens=120):
+    prompt = f"Вопрос: {question}\nОтвет: "
+    context = torch.tensor([[stoi.get(c, 0) for c in prompt]], device=device)
+    
+    for _ in range(max_new_tokens):
+        logits = model(context[:, -config["block_size"]:])
+        logits = logits[0, -1, :] / config["temperature"]
+        
+        top_k = min(config["top_k"], vocab_size)
+        top_logits, top_indices = torch.topk(logits, top_k)
+        probs = F.softmax(top_logits, dim=-1)
+        next_token = top_indices[torch.multinomial(probs, 1)]
+        
+        context = torch.cat([context, next_token.unsqueeze(0)], dim=1)
+        
+        if itos[next_token.item()] == '\n':
+            break
+    
+    generated = ''.join([itos[int(i)] for i in context[0].tolist()])
+    if "Ответ:" in generated:
+        return generated.split("Ответ:")[-1].strip()
+    return generated[len(prompt):].strip()
+
+os.makedirs("checkpoints", exist_ok=True)
+
+print("Начало обучения!")
+print(f"Всего шагов: {config['steps']}")
 print()
 
-start = time.time()
+start_time = time.time()
+best_val_loss = float('inf')
 
-for step in range(steps):
+for step in range(config["steps"]):
     x, y = get_batch('train')
     x, y = x.to(device), y.to(device)
-
+    
     logits = model(x)
     loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-
+    
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     scheduler.step()
+    
+    if step % config["eval_interval"] == 0 and step > 0:
+        elapsed = time.time() - start_time
+        eta = (config["steps"] - step) * (elapsed / (step + 1)) / 60
+        
+        losses = estimate_loss()
+        
+        print(f"\nstep {step:6d}/{config['steps']}")
+        print(f"   train_loss: {losses['train']:.4f}")
+        print(f"   val_loss: {losses['val']:.4f}")
+        print(f"   lr: {scheduler.get_last_lr()[0]:.2e}")
+        print(f"   ETA: {eta:.0f} мин")
+        
+        if losses['val'] < best_val_loss:
+            best_val_loss = losses['val']
+            torch.save({
+                "step": step,
+                "model": model.state_dict(),
+                "stoi": stoi,
+                "itos": itos,
+                "val_loss": losses['val'],
+                "config": config
+            }, f"checkpoints/best_model_step_{step}_loss_{losses['val']:.4f}.pth")
+            print(f"   ✨ Новая лучшая модель! Loss: {losses['val']:.4f}")
 
-    if step % 1000 == 0:
-        elapsed = time.time() - start
-        eta = (steps - step) * (elapsed / (step + 1)) / 60
-        print(
-            f"step {step:5d}/{steps} | loss {loss.item():.3f} | lr {scheduler.get_last_lr()[0]:.2e} | ETA {eta:.0f}мин")
+print("\n" + "=" * 60)
+print("Сохранение финальной модели")
+print("=" * 60)
 
-        # Сохраняем чекпоинт
-        if step > 0 and step % 5000 == 0:
-            torch.save(model.state_dict(), f"checkpoint_{step}.pth")
-
-total_time = (time.time() - start) / 60
-print(f"\n✅ ГОТОВО! Время: {total_time:.1f} минут")
-
-# Сохраняем финальную модель
 torch.save({
     "model": model.state_dict(),
     "stoi": stoi,
     "itos": itos,
-    "config": {
-        "block_size": block_size,
-        "vocab_size": vocab_size,
-        "n_embed": n_embed,
-        "n_head": n_head,
-        "n_layer": n_layer
-    }
-}, "smart_model.pth")
-print("💾 Модель сохранена в smart_model.pth")
+    "config": config
+}, "comfortable_gpt.pth")
 
-# ============ ТЕСТ ============
-print("\n" + "=" * 50)
-print("💬 ТЕСТ ДИАЛОГА")
-print("=" * 50)
+print("✅ Модель сохранена в comfortable_gpt.pth")
+
+print("\n" + "=" * 60)
+print("ТЕСТ ОБЩЕНИЯ")
+print("=" * 60)
 
 model.eval()
-
-
-def ask(question, max_tokens=100, temperature=0.7):
-    prompt = f"Вопрос: {question}\nОтвет: "
-    context = torch.tensor([[stoi.get(c, 0) for c in prompt]], device=device)
-
-    with torch.no_grad():
-        for _ in range(max_tokens):
-            logits = model(context[:, -block_size:])
-            logits = logits[0, -1, :] / temperature
-            probs = F.softmax(logits, dim=-1)
-
-            # Top-k sampling
-            top_k = 50
-            probs, indices = torch.topk(probs, top_k)
-            next_token = indices[torch.multinomial(probs, 1)]
-
-            context = torch.cat([context, next_token.unsqueeze(0)], dim=1)
-
-            # Стоп при переносе строки
-            if itos[next_token.item()] == '\n':
-                break
-
-    generated = ''.join([itos[int(i)] for i in context[0].tolist()])
-    if "Ответ:" in generated:
-        response = generated.split("Ответ:")[-1].strip()
-    else:
-        response = generated[len(prompt):].strip()
-
-    return response
-
 
 test_questions = [
     "Привет, как дела?",
     "Что посоветуешь?",
-    "Как стать счастливым?"
+    "Как стать счастливым?",
+    "Расскажи шутку",
+    "Что ты умеешь?"
 ]
 
 for q in test_questions:
+    response = generate_response(q)
     print(f"\n❓ {q}")
-    print(f"🤖 {ask(q)}")
+    print(f"🤖 {response}")
 
-print("\n" + "=" * 50)
-print("🎉 ГОТОВО!")
-print("=" * 50)
+print("\n" + "=" * 60)
+print("ЧАТ-БОТ ЗАПУЩЕН")
+print("Введите 'выход' или 'quit' для выхода")
+print("=" * 60)
+
+while True:
+    user_input = input("\nВы: ").strip()
+    if user_input.lower() in ['выход', 'quit', 'exit']:
+        print("До свидания!")
+        break
+    if user_input:
+        response = generate_response(user_input)
+        print(f"Бот: {response}")
