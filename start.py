@@ -1,142 +1,273 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import json
+import os
+import math
 
-# ============ ТА ЖЕ САМАЯ МОДЕЛЬ (скопируй классы) ============
-class Head(nn.Module):
-    def __init__(self, head_size, n_embed, block_size):
+# ========== НАСТРОЙКИ ==========
+config = {
+    "block_size": 512,
+    "n_embed": 512,
+    "n_head": 8,
+    "n_layer": 8,
+    "dropout": 0.1,
+    "temperature": 0.7,
+    "top_k": 40,
+    "max_new_tokens": 100,
+}
+
+
+# ========== МОДЕЛЬ ==========
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_embed, n_head):
         super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.dropout = nn.Dropout(0.1)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        assert n_embed % n_head == 0
+        self.n_head = n_head
+        self.n_embed = n_embed
+        self.head_dim = n_embed // n_head
+
+        self.c_attn = nn.Linear(n_embed, 3 * n_embed)
+        self.c_proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(config['dropout'])
+
+        self.register_buffer("bias", torch.tril(torch.ones(config["block_size"], config["block_size"]))
+                             .view(1, 1, config["block_size"], config["block_size"]))
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-        wei = q @ k.transpose(-2, -1) * (C ** -0.5)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        v = self.value(x)
-        return wei @ v
+        qkv = self.c_attn(x)
+        q, k, v = qkv.chunk(3, dim=-1)
 
-class MultiHead(nn.Module):
-    def __init__(self, n_embed, n_head, block_size):
-        super().__init__()
-        head_size = n_embed // n_head
-        self.heads = nn.ModuleList([Head(head_size, n_embed, block_size) for _ in range(n_head)])
-        self.proj = nn.Linear(n_embed, n_embed)
-        self.dropout = nn.Dropout(0.1)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
-        out = self.dropout(out)
-        return out
+        if hasattr(F, 'scaled_dot_product_attention'):
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.dropout(att)
+            y = att @ v
 
-class FeedForward(nn.Module):
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        y = self.dropout(y)
+        return y
+
+
+class MLP(nn.Module):
     def __init__(self, n_embed):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
-            nn.GELU(),
-            nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(0.1)
-        )
+        self.c_fc = nn.Linear(n_embed, 4 * n_embed)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4 * n_embed, n_embed)
+        self.dropout = nn.Dropout(config['dropout'])
 
     def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    def __init__(self, n_embed, n_head, block_size):
-        super().__init__()
-        self.sa = MultiHead(n_embed, n_head, block_size)
-        self.ff = FeedForward(n_embed)
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.ln2 = nn.LayerNorm(n_embed)
-
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ff(self.ln2(x))
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
         return x
 
-class GPT(nn.Module):
-    def __init__(self, vocab_size, config):
+
+class TransformerBlock(nn.Module):
+    def __init__(self, n_embed, n_head):
         super().__init__()
-        self.config = config
-        self.token_embed = nn.Embedding(vocab_size, config['n_embed'])
-        self.pos_embed = nn.Embedding(config['block_size'], config['n_embed'])
-        self.blocks = nn.Sequential(*[Block(config['n_embed'], config['n_head'], config['block_size']) 
-                                       for _ in range(config['n_layer'])])
-        self.ln = nn.LayerNorm(config['n_embed'])
-        self.head = nn.Linear(config['n_embed'], vocab_size)
+        self.ln_1 = nn.LayerNorm(n_embed)
+        self.attn = CausalSelfAttention(n_embed, n_head)
+        self.ln_2 = nn.LayerNorm(n_embed)
+        self.mlp = MLP(n_embed)
 
     def forward(self, x):
-        B, T = x.shape
-        tok = self.token_embed(x)
-        pos = self.pos_embed(torch.arange(T, device=x.device))
-        x = tok + pos
-        x = self.blocks(x)
-        x = self.ln(x)
-        return self.head(x)
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
 
-# ============ ЗАГРУЗКА МОДЕЛИ ============
-print("Загрузка модели...")
 
-# Загружаем сохраненную модель
-checkpoint = torch.load("comfortable_gpt.pth", map_location='cpu')
+class SmartGPT(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.wte = nn.Embedding(vocab_size, config["n_embed"])
+        self.wpe = nn.Embedding(config["block_size"], config["n_embed"])
+        self.drop = nn.Dropout(config['dropout'])
 
-config = checkpoint['config']
-stoi = checkpoint['stoi']
-itos = checkpoint['itos']
-vocab_size = len(stoi)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(config["n_embed"], config["n_head"])
+            for _ in range(config["n_layer"])
+        ])
 
-# Создаем модель
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-model = GPT(vocab_size, config).to(device)
-model.load_state_dict(checkpoint['model'])
-model.eval()
+        self.ln_f = nn.LayerNorm(config["n_embed"])
+        self.lm_head = nn.Linear(config["n_embed"], vocab_size, bias=False)
 
-print(f"Модель загружена! Устройство: {device}")
-print()
+        self.wte.weight = self.lm_head.weight
 
-# ============ ФУНКЦИЯ ДЛЯ ОБЩЕНИЯ ============
-def chat(question, max_tokens=100, temperature=0.7):
-    prompt = f"Вопрос: {question}\nОтвет: "
-    context = torch.tensor([[stoi.get(c, 0) for c in prompt]], device=device)
-    
-    with torch.no_grad():
-        for _ in range(max_tokens):
-            logits = model(context[:, -config['block_size']:])
-            logits = logits[0, -1, :] / temperature
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, 1)
-            context = torch.cat([context, next_token.unsqueeze(0)], dim=1)
-            
-            if itos[next_token.item()] == '\n':
-                break
-    
-    generated = ''.join([itos[int(i)] for i in context[0].tolist()])
-    if "Ответ:" in generated:
-        return generated.split("Ответ:")[-1].strip()
-    return generated[len(prompt):].strip()
+    def forward(self, idx):
+        B, T = idx.shape
+        assert T <= config["block_size"]
 
-# ============ ЧАТ ============
-print("=" * 50)
-print("ЧАТ ЗАПУЩЕН")
-print("Введите 'выход' или 'quit' для выхода")
-print("=" * 50)
+        tok_emb = self.wte(idx)
+        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
+        pos_emb = self.wpe(pos)
+        x = self.drop(tok_emb + pos_emb)
 
-while True:
-    user_input = input("\nВы: ").strip()
-    
-    if user_input.lower() in ['выход', 'quit', 'exit']:
-        print("До свидания!")
-        break
-    
-    if user_input:
-        response = chat(user_input)
-        print(f"Бот: {response}")
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        return logits
+
+
+# ========== ЗАГРУЗКА ==========
+def load_model():
+    print("=" * 60)
+    print("🤖 ЗАГРУЗКА МОДЕЛИ")
+    print("=" * 60)
+
+    # Загружаем словарь
+    with open("cache/vocab.json", "r", encoding="utf-8") as f:
+        vocab_data = json.load(f)
+
+    stoi = vocab_data['stoi']
+    itos = {int(k): v for k, v in vocab_data['itos'].items()}
+    vocab_size = vocab_data['vocab_size']
+    special_tokens = vocab_data.get('special_tokens', {
+        '<BOS>': 0, '<EOS>': 1, '<Q>': 2, '<A>': 3, '<PAD>': 4
+    })
+
+    print(f"✅ Загружен словарь: {vocab_size} токенов")
+
+    # Загружаем модель
+    checkpoint = torch.load("best_model.pth", map_location='cpu')
+    model = SmartGPT(vocab_size)
+
+    if 'model_state' in checkpoint:
+        model.load_state_dict(checkpoint['model_state'])
+        print(f"✅ Модель загружена! Шаг: {checkpoint.get('step', 'unknown')}")
+    else:
+        model.load_state_dict(checkpoint)
+        print(f"✅ Модель загружена!")
+
+    return model, stoi, itos, special_tokens
+
+
+# ========== ГЕНЕРАЦИЯ ==========
+@torch.no_grad()
+def generate_response(model, prompt, stoi, itos, special_tokens,
+                      max_new_tokens=100, temperature=0.7, top_k=40):
+    model.eval()
+    device = next(model.parameters()).device
+
+    # Форматируем промпт КАК ПРИ ОБУЧЕНИИ
+    prompt = f"<BOS><Q>{prompt}<A>"
+
+    # Токенизация
+    context = []
+    for ch in prompt:
+        if ch in stoi:
+            context.append(stoi[ch])
+        else:
+            context.append(special_tokens.get('<PAD>', 4))
+
+    context = torch.tensor(context, device=device).unsqueeze(0)
+
+    # Генерация
+    for _ in range(max_new_tokens):
+        if context.size(1) > config["block_size"]:
+            context = context[:, -config["block_size"]:]
+
+        logits = model(context)
+        logits = logits[0, -1, :] / temperature
+
+        if top_k > 0:
+            top_k_val = min(top_k, len(logits))
+            top_k_logits, _ = torch.topk(logits, top_k_val)
+            indices_to_remove = logits < top_k_logits[..., -1, None]
+            logits[indices_to_remove] = float('-inf')
+
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, 1)
+
+        if next_token.item() == special_tokens.get('<EOS>', 1):
+            break
+
+        # Останавливаемся при длинном ответе
+        if len(context[0]) > 50 and next_token.item() == stoi.get('.', 0):
+            break
+
+        context = torch.cat([context, next_token.unsqueeze(0)], dim=1)
+
+    # Декодируем
+    response = ''
+    for t in context[0]:
+        token = itos[t.item()]
+        if token not in special_tokens:
+            response += token
+
+    # Извлекаем ответ после <A>
+    if '<A>' in response:
+        response = response.split('<A>')[-1].strip()
+
+    # Обрезаем слишком длинные ответы
+    if len(response) > 150:
+        response = response[:150] + "..."
+
+    return response if response else "Извините, я не могу ответить."
+
+
+# ========== ЧАТ ==========
+def chat():
+    print("\n" + "=" * 60)
+    print("💬 ПРОСТОЙ ЧАТ")
+    print("=" * 60)
+
+    # Загружаем модель
+    model, stoi, itos, special_tokens = load_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    model.eval()
+
+    print(f"\n💻 Устройство: {device}")
+    print(f"📊 Параметров: {sum(p.numel() for p in model.parameters()):,}")
+
+    print("\n" + "=" * 60)
+    print("Команды: /temp [число] - изменить креативность, /quit - выход")
+    print("=" * 60)
+
+    temperature = 0.7
+    print(f"\n🤖 Бот готов! (креативность={temperature})")
+    print("💬 Задайте вопрос...\n")
+
+    while True:
+        user_input = input("👤 Вы: ").strip()
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in ['/quit', 'quit', 'выход']:
+            print("\n🤖 Бот: До свидания! 👋")
+            break
+
+        if user_input.startswith('/temp'):
+            try:
+                temperature = float(user_input.split()[1])
+                temperature = max(0.3, min(1.2, temperature))
+                print(f"✅ Креативность = {temperature}")
+                continue
+            except:
+                print("❌ Используйте: /temp 0.7")
+                continue
+
+        print("🤖 Бот: ", end="", flush=True)
+        response = generate_response(model, user_input, stoi, itos, special_tokens,
+                                     temperature=temperature)
+        print(response)
+        print()
+
+
+if __name__ == "__main__":
+    chat()
